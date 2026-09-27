@@ -15,6 +15,9 @@ from airtouch2.protocol.at2plus.crc16_modbus import crc16
 from airtouch2.common.interfaces import Callback, Serializable, TaskCreator
 from airtouch2.protocol.at2plus.messages.GroupNames import RequestGroupNamesMessage, group_names_from_subdata
 from airtouch2.protocol.at2plus.messages.GroupStatus import GroupStatusMessage
+from airtouch2.protocol.at2plus.messages.AcControl import AcControlMessage
+from airtouch2.protocol.at2plus.messages.GroupControl import GroupControlMessage
+from airtouch2.protocol.at2plus.enums import AcSetPower, GroupSetPower, GroupSetDamper
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +51,9 @@ class At2PlusClient:
     async def stop(self) -> None:
         await self._client.stop()
 
+    async def reconnect(self) -> None:
+        await self._client.reconnect()
+
     def add_new_ac_callback(self, callback: Callback):
         self._new_ac_callbacks.append(callback)
 
@@ -67,7 +73,18 @@ class At2PlusClient:
         return remove_callback
 
     async def send(self, msg: Serializable):
-        await self._client.send(msg)
+        # Absolute settings can be repeated without toggling back or incrementing
+        # twice. Never replay an unknown command following an ambiguous failure.
+        retry_safe = isinstance(msg, (AcStatusMessage, GroupStatusMessage))
+        if isinstance(msg, AcControlMessage):
+            retry_safe = all(s.power != AcSetPower.TOGGLE for s in msg.settings)
+        elif isinstance(msg, GroupControlMessage):
+            retry_safe = all(
+                s.power != GroupSetPower.NEXT
+                and s.damp_mode not in (GroupSetDamper.INC, GroupSetDamper.DEC)
+                for s in msg.settings
+            )
+        await self._client.send(msg, retry_safe=retry_safe)
 
     async def handle_one_message(self) -> None:
         message = await self._read_message()
