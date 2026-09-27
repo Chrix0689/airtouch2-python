@@ -43,6 +43,7 @@ class NetClient:
         self._task_creator: Callable = task_creator
         self._main_loop_task: asyncio.Task[None] | None = None
         self._stop: bool = False
+        self._reconnect_lock = asyncio.Lock()
 
         self._on_connect = on_connect
         self._handle_message = handle_message
@@ -61,6 +62,9 @@ class NetClient:
                 raise e
             return False
         else:
+            if self._stop:
+                self._close_connection()
+                return False
             _set_keepalive_options(
                 self._writer.get_extra_info("socket"),
                 idle_seconds=5,
@@ -77,32 +81,57 @@ class NetClient:
 
     async def stop(self) -> None:
         """Stops the processing of incoming information from the server"""
-        if not self._main_loop_task:
-            raise RuntimeError("Client task is not running")
         self._stop = True
-        self._main_loop_task.cancel()
-        try:
-            await self._main_loop_task
-        except asyncio.CancelledError as e:
-            # Eat the expected exception
-            pass
+        if self._main_loop_task:
+            self._main_loop_task.cancel()
+            try:
+                await self._main_loop_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._main_loop_task = None
+                self._close_connection()
+        else:
+            self._close_connection()
 
-    async def send(self, message: Serializable) -> None:
-        """Send the serializable 'message'"""
-        if self._writer is None:
+    def _close_connection(self):
+        if self._writer is not None:
+            self._writer.close()
+        self._reader = None
+        self._writer = None
+
+    async def reconnect(self):
+        """Replace an unresponsive connection, sharing concurrent recovery."""
+        await self._try_reconnect(self._writer)
+
+    async def send(self, message: Serializable, *, retry_safe: bool = False) -> None:
+        """Send a message; replay only explicitly idempotent messages once.
+
+        A failed drain does not tell us whether the controller applied a command.
+        Relative commands must surface that uncertainty, never be replayed.
+        """
+        if self._writer is None and retry_safe and not self._stop:
+            await asyncio.wait_for(self._try_reconnect(None), timeout=10)
+        if self._writer is None or self._stop:
             raise RuntimeError("Client is not connected - call connect() first")
         else:
             bytes_to_write = message.to_bytes()
             _LOGGER.debug(f"Sending {message.__class__.__name__} with data: {bytes_to_write.hex(':')}")
             _LOGGER.debug(f"{repr(message)}")
-            self._writer.write(bytes_to_write)
-            drained: bool = False
-            while not drained:
+            for attempt in range(2):
+                writer = self._writer
                 try:
-                    await self._writer.drain()
-                    drained = True
-                except (ConnectionResetError, asyncio.IncompleteReadError, TimeoutError) as e:
-                    await self._try_reconnect()
+                    if writer is None:
+                        raise ConnectionError("AirTouch connection is recovering")
+                    writer.write(bytes_to_write)
+                    await writer.drain()
+                    return
+                except (OSError, asyncio.IncompleteReadError) as e:
+                    if not retry_safe or attempt:
+                        raise ConnectionError(
+                            "AirTouch command delivery could not be confirmed"
+                        ) from e
+                    await asyncio.wait_for(self._try_reconnect(writer), timeout=10)
 
     async def read_bytes(self, size: int) -> bytes | None:
         """
@@ -110,34 +139,50 @@ class NetClient:
         This coroutine handles reconnection.
         """
         if self._reader is None:
-            raise RuntimeError("Client is not connected - call connect() first")
+            await self._try_reconnect(self._writer)
+            return None
+        reader, writer = self._reader, self._writer
         try:
-            data = await self._reader.readexactly(size)
+            data = await reader.readexactly(size)
         except asyncio.IncompleteReadError as e:
             _LOGGER.debug(f"IncompleteReadError - partial bytes: {e.partial.hex(':')}")
             data = None
-        except (ConnectionResetError, TimeoutError) as e:
+        except OSError as e:
             _LOGGER.debug("ConnectionResetError")
             data = None
 
         if data is None:
             _LOGGER.warning("Connection lost, reconnecting")
-            await self._try_reconnect()
+            await self._try_reconnect(writer)
+            return None
+        if reader is not self._reader:
             return None
         _LOGGER.debug(f"Read payload of size {size}: {data.hex(':')}")
         return data
 
     async def _main(self) -> None:
         while not self._stop:
-            if not (self._reader and self._writer):
-                raise RuntimeError("Client is not connected - call connect() first")
             await self._handle_message()
 
-    async def _try_reconnect(self) -> None:
-        retries = 0
-        while not await self.connect():
-            await asyncio.sleep(0.001 * (10**retries) if retries < 4 else 10)
-            retries += 1
-            if not retries % 60 or retries == 4:
-                _LOGGER.info("Server is not responding, will continue trying to reconnect every 10s")
-        _LOGGER.info("Reconnected")
+    async def _try_reconnect(self, failed_writer) -> None:
+        async with self._reconnect_lock:
+            if self._stop:
+                raise ConnectionError("AirTouch client has stopped")
+            if self._writer is not None and self._writer is not failed_writer:
+                return
+            self._close_connection()
+            retries = 0
+            while not self._stop:
+                try:
+                    if await self.connect():
+                        _LOGGER.info("Reconnected")
+                        return
+                except OSError:
+                    pass
+                except BaseException:
+                    self._close_connection()
+                    raise
+                self._close_connection()
+                await asyncio.sleep(min(0.1 * 2 ** min(retries, 7), 10))
+                retries += 1
+            raise ConnectionError("AirTouch client has stopped")
